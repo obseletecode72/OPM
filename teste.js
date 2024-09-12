@@ -1,16 +1,11 @@
 const net = require('net');
-
-const serverIP = '127.0.0.1';
-const serverPort = 25565;
-const username = 'BotTesteKK';
+const readline = require('readline');
 
 const ConnectionState = {
   HANDSHAKING: 0,
   LOGIN: 2,
   PLAY: 3
 };
-
-let connectionState = ConnectionState.HANDSHAKING;
 
 function readVarInt(buffer, offset = 0) {
   let numRead = 0;
@@ -46,16 +41,11 @@ function displayPacket(buffer) {
   const { value: packetId, size: idSize } = readVarInt(buffer, offset);
   offset += idSize;
   const packetData = buffer.slice(offset);
-
   if (packetLength === 6 && packetId === 0x00 && packetData[0] === 0x00) {
     console.log(`keep-alive detected. sending back.`);
-    sendKeepAliveResponse(buffer);
+    return buffer;
   }
-}
-
-function sendKeepAliveResponse(buffer) {
-  client.write(buffer);
-  console.log(`sent keep-alive: ${buffer.toString('hex')}`);
+  return null;
 }
 
 function createPacket(packetId, data) {
@@ -64,36 +54,70 @@ function createPacket(packetId, data) {
   return Buffer.concat([packetLength, idBuffer, data]);
 }
 
-function handshakePacket() {
+function handshakePacket(serverIP, serverPort) {
   const protocolVersion = createVarInt(47);
   const serverAddress = Buffer.concat([Buffer.from([serverIP.length]), Buffer.from(serverIP)]);
-  const serverPort = Buffer.from([0x63, 0xdd]);
+  const portBuffer = Buffer.alloc(2);
+  portBuffer.writeUInt16BE(serverPort);
   const nextState = createVarInt(2);
-  connectionState = ConnectionState.LOGIN;
-  return createPacket(0x00, Buffer.concat([protocolVersion, serverAddress, serverPort, nextState]));
+  return createPacket(0x00, Buffer.concat([protocolVersion, serverAddress, portBuffer, nextState]));
 }
 
-function loginStartPacket() {
+function loginStartPacket(username) {
   const nameLength = createVarInt(username.length);
   const usernameBuffer = Buffer.from(username, 'utf-8');
   return createPacket(0x00, Buffer.concat([nameLength, usernameBuffer]));
 }
 
-const client = new net.Socket();
-client.connect(serverPort, serverIP, () => {
-  console.log('Bot connected!');
-  client.write(handshakePacket());
-  client.write(loginStartPacket());
+function connectBot(serverIP, serverPort, username) {
+  const client = new net.Socket();
+  let connectionState = ConnectionState.HANDSHAKING;
+
+  client.connect(serverPort, serverIP, () => {
+    console.log(`Bot ${username} connected!`);
+    client.write(handshakePacket(serverIP, serverPort));
+    client.write(loginStartPacket(username));
+    connectionState = ConnectionState.LOGIN;
+  });
+
+  client.on('data', (data) => {
+    const response = displayPacket(data);
+    if (response) {
+      client.write(response);
+    }
+  });
+
+  client.on('error', (err) => {
+    console.error(`Error for bot ${username}:`, err);
+  });
+
+  client.on('close', () => {
+    console.log(`Connection closed for bot ${username}`);
+  });
+}
+
+const rl = readline.createInterface({
+  input: process.stdin,
+  output: process.stdout
 });
 
-client.on('data', (data) => {
-  displayPacket(data);
-});
+rl.question('Digite o IP do servidor: ', (serverIP) => {
+  rl.question('Digite a porta do servidor: ', (serverPort) => {
+    rl.question('Digite o número de bots para conectar por segundo: ', (botsPerSecond) => {
+      rl.close();
 
-client.on('error', (err) => {
-  console.error('shitty error:', err);
-});
+      const connectRate = parseInt(botsPerSecond);
+      let botCount = 0;
 
-client.on('close', () => {
-  console.log('wtf happened to the bot.');
+      console.log(`Conectando ${connectRate} bots por segundo a ${serverIP}:${serverPort} indefinidamente.`);
+
+      setInterval(() => {
+        for (let i = 0; i < connectRate; i++) {
+          botCount++;
+          connectBot(serverIP, parseInt(serverPort), `Bot${botCount}`);
+        }
+        console.log(`Total de bots conectados: ${botCount}`);
+      }, 1000);
+    });
+  });
 });

